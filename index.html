@@ -293,6 +293,22 @@
                     notify(key, next);
                     return next;
                 },
+                async updateLiveActivity(roomCode, activityKey, payload) {
+                    const key = 'room_' + roomCode;
+                    const prev = readJSON(key, { roomCode, createdAt: Date.now() });
+                    const next = {
+                        ...prev,
+                        roomCode,
+                        liveActivity: {
+                            ...(prev.liveActivity || {}),
+                            [activityKey]: { ...payload, ts: Date.now() }
+                        },
+                        updatedAt: Date.now()
+                    };
+                    writeJSON(key, next);
+                    notify(key, next);
+                    return next;
+                },
                 subscribeRoom(roomCode, cb) {
                     const key = 'room_' + roomCode;
                     const existing = readJSON(key, null);
@@ -1472,21 +1488,17 @@
         // =========================================================================
         const App = () => {
             const restored = useMemo(() => loadPersistedSession(), []);
-            const initialSharedCode = useMemo(
-                () => normalizeRoomCode(restored?.roomCode || window.FB_BRIDGE?.getActiveRoomCode?.() || DEFAULT_ROOM_CODE),
-                []
-            );
+            const roomCode = DEFAULT_ROOM_CODE;
 
             const [screen, setScreen] = useState(restored?.screen || 'home');
             const [activeWorld, setActiveWorld] = useState(restored?.activeWorld || 'people');
-            const [user, setUser] = useState(restored?.user || { name: '', class: '', groupName: '', members: '', avatar: '🕵️‍♂️', roomCode: initialSharedCode });
+            const [user, setUser] = useState(restored?.user || { name: '', class: '', groupName: '', members: '', avatar: '🕵️‍♂️', roomCode: DEFAULT_ROOM_CODE });
             const [progress, setProgress] = useState(restored?.progress || { points: 0, stars: 0, completed: [] });
             const [savedWritings, setSavedWritings] = useState(restored?.savedWritings || {});
 
-            // Multiplayer States
+            // Multiplayer States (Fixed Shared Live Room)
             const [isTeacherHost, setIsTeacherHost] = useState(!!restored?.isTeacherHost);
             const [teacherName, setTeacherName] = useState(restored?.teacherName || 'Guru Utama');
-            const [roomCode, setRoomCode] = useState(initialSharedCode);
             const [connStatus, setConnStatus] = useState('online');
             const [roomData, setRoomData] = useState(null);
             const [roomPlayers, setRoomPlayers] = useState([]);
@@ -1495,21 +1507,17 @@
             const [activeSpeaker, setActiveSpeaker] = useState('');
             const [showCertificate, setShowCertificate] = useState(false);
 
-            // Student Change Room Code Modal
-            const [showChangeCodeModal, setShowChangeCodeModal] = useState(false);
-            const [newRoomCodeInput, setNewRoomCodeInput] = useState('');
-
             // UI Feedback
             const [modal, setModal] = useState({ show: false, title: '', message: '', type: 'info', onClose: null });
             const [rewardAnim, setRewardAnim] = useState(null);
 
-            const isStudentFocusLocked = !isTeacherHost && !!roomCode && !!roomData?.focusMode;
+            const isStudentFocusLocked = !isTeacherHost && !!roomData?.focusMode;
 
             // Persist state automatically so browser refresh never resets progress
             useEffect(() => {
-                const snapshot = { screen, activeWorld, user, progress, savedWritings, isTeacherHost, teacherName, roomCode };
+                const snapshot = { screen, activeWorld, user: { ...user, roomCode: DEFAULT_ROOM_CODE }, progress, savedWritings, isTeacherHost, teacherName, roomCode: DEFAULT_ROOM_CODE };
                 savePersistedSession(snapshot);
-            }, [screen, activeWorld, user, progress, savedWritings, isTeacherHost, teacherName, roomCode]);
+            }, [screen, activeWorld, user, progress, savedWritings, isTeacherHost, teacherName]);
 
             // Subscribe to Room, Players, Chat, and Walkie-Talkie Voice
             useEffect(() => {
@@ -1548,18 +1556,27 @@
                 };
             }, [roomCode, voiceMuted]);
 
-            // Publish Teacher's live screen & focus state
+            // Publish Teacher's live screen & focus state whenever teacher navigates
             useEffect(() => {
                 if (!roomCode || !isTeacherHost || !window.FB_BRIDGE?.ready) return;
-                window.FB_BRIDGE.upsertRoom(roomCode, {
+                if (screen === 'home' || screen === 'identity') return;
+
+                const patch = {
                     roomCode,
-                    hostCode: makeHostCode(roomCode),
                     teacherName,
-                    liveScreen: screen,
-                    liveWorld: activeWorld,
-                    focusScreen: roomData?.focusMode ? screen : (roomData?.focusScreen || screen),
-                    focusWorld: roomData?.focusMode ? activeWorld : (roomData?.focusWorld || activeWorld)
-                });
+                    liveWorld: activeWorld
+                };
+
+                if (screen !== 'dashboard') {
+                    patch.liveScreen = screen;
+                    patch.focusScreen = screen;
+                    patch.focusWorld = activeWorld;
+                    if (screen !== 'live_shared_task' && roomData?.sharedTask?.active) {
+                        patch.sharedTask = { ...(roomData.sharedTask || {}), active: false };
+                    }
+                }
+
+                window.FB_BRIDGE.upsertRoom(roomCode, patch);
             }, [roomCode, isTeacherHost, screen, activeWorld, teacherName]);
 
             // Auto-follow teacher's live screen / shared task when Focus Mode or Shared Task is active
@@ -1622,79 +1639,14 @@
                 });
             };
 
-            // Broadcast live activity updates during Focus Mode so everyone sees answers in real time
+            // Broadcast live activity updates so Teacher & all Students see answers immediately
             const syncLiveActivity = (activityKey, payload) => {
-                if (!roomCode || !roomData?.focusMode) return;
+                if (!roomCode || !window.FB_BRIDGE?.ready) return;
                 const actor = isTeacherHost ? teacherName : (user.name || 'Student');
-                window.FB_BRIDGE.upsertRoom(roomCode, {
-                    liveActivity: {
-                        ...(roomData.liveActivity || {}),
-                        [activityKey]: { ...payload, by: actor, ts: Date.now() }
-                    }
-                });
-            };
-
-            // Student Change Room Code Handlers
-            const handleOpenChangeCode = () => {
-                setNewRoomCodeInput(roomCode || '');
-                setShowChangeCodeModal(true);
-            };
-
-            const handleSwitchStudentRoom = async (e) => {
-                e.preventDefault();
-                const cleanCode = normalizeRoomCode(newRoomCodeInput);
-                if (!cleanCode || cleanCode.length < 3) {
-                    showModal("Kode Tidak Valid ❌", "Masukkan kode bergabung baru dari guru (minimal 3 karakter, contoh: AB12CD).", "error");
-                    return;
-                }
-
-                setRoomData(null);
-                setRoomPlayers([]);
-                setRoomMessages([]);
-                setRoomCode(cleanCode);
-                setUser(prev => ({ ...prev, roomCode: cleanCode }));
-                setIsTeacherHost(false);
-                setShowChangeCodeModal(false);
-                setNewRoomCodeInput('');
-
-                if (window.FB_BRIDGE?.ready && user.name) {
-                    await window.FB_BRIDGE.upsertPlayer(cleanCode, window.FB_BRIDGE.uid, {
-                        name: user.name,
-                        class: user.class || 'VII',
-                        groupName: user.groupName || '',
-                        avatar: user.avatar || '🕵️‍♂️',
-                        points: progress.points,
-                        stars: progress.stars,
-                        level: calcLevel(progress.points)
-                    });
-                    const latestRoom = await window.FB_BRIDGE.fetchRoom(cleanCode);
-                    if (latestRoom) {
-                        setRoomData(latestRoom);
-                        if (latestRoom.sharedTask?.active) {
-                            setScreen('live_shared_task');
-                        } else if (latestRoom.focusMode) {
-                            if (latestRoom.focusWorld) setActiveWorld(latestRoom.focusWorld);
-                            if (latestRoom.focusScreen && latestRoom.focusScreen !== 'dashboard') setScreen(latestRoom.focusScreen);
-                        } else if (latestRoom.liveScreen && latestRoom.liveScreen !== 'dashboard' && latestRoom.liveScreen !== 'home') {
-                            if (latestRoom.liveWorld) setActiveWorld(latestRoom.liveWorld);
-                            setScreen(latestRoom.liveScreen);
-                        } else {
-                            setScreen('map');
-                        }
-                    } else {
-                        setScreen('map');
-                    }
-                }
-
-                showModal(
-                    "Kode Room Diperbarui! 🔑",
-                    `Anda kini terhubung ke Room ${cleanCode}. Layar Anda otomatis mengikuti kegiatan yang sedang live dari guru!`,
-                    "success"
-                );
+                window.FB_BRIDGE.updateLiveActivity(roomCode, activityKey, { ...payload, by: actor });
             };
 
             const handleGoHome = () => {
-                setShowChangeCodeModal(false);
                 setScreen('home');
             };
 
@@ -1703,7 +1655,7 @@
                 const nextFocus = !roomData?.focusMode;
                 window.FB_BRIDGE.upsertRoom(roomCode, {
                     focusMode: nextFocus,
-                    focusScreen: screen === 'dashboard' ? 'map' : screen,
+                    focusScreen: screen === 'dashboard' ? (roomData?.liveScreen && roomData.liveScreen !== 'dashboard' ? roomData.liveScreen : 'map') : screen,
                     focusWorld: activeWorld,
                     sharedTask: { ...(roomData?.sharedTask || {}), active: false }
                 });
@@ -1765,12 +1717,10 @@
                                     </div>
                                     <div className="text-brand-sky text-[11px] font-bold uppercase flex items-center gap-1.5">
                                         <span>{isTeacherHost ? 'Teacher Control' : (user.class ? `Class ${user.class}` : 'Grade VII')}</span>
-                                        {roomCode && (
-                                            <span className="inline-flex items-center gap-1">
-                                                • Room {roomCode}
-                                                <span className={`inline-block w-2 h-2 rounded-full ${connStatus === 'online' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`}></span>
-                                            </span>
-                                        )}
+                                        <span className="inline-flex items-center gap-1">
+                                            • Live Class
+                                            <span className={`inline-block w-2 h-2 rounded-full ${connStatus === 'online' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`}></span>
+                                        </span>
                                     </div>
                                 </div>
                             </div>
@@ -1798,7 +1748,7 @@
                                 />
                             </div>
 
-                            {/* Right: Navigation, Ganti Kode & Home */}
+                            {/* Right: Navigation & Home */}
                             <div className="flex items-center gap-1.5">
                                 {!isStudentFocusLocked && (
                                     <button type="button" onClick={() => setScreen('map')} className="hidden sm:flex btn-3d btn-secondary px-2.5 py-1 text-[11px] rounded-lg">
@@ -1818,16 +1768,6 @@
                                             👩‍🏫 Dashboard
                                         </button>
                                     </>
-                                )}
-                                {!isTeacherHost && (
-                                    <button
-                                        type="button"
-                                        onClick={handleOpenChangeCode}
-                                        className="btn-3d btn-primary px-2.5 py-1 text-[11px] rounded-lg"
-                                        title="Ganti Kode Room Murid"
-                                    >
-                                        🔑 Ganti Kode
-                                    </button>
                                 )}
                                 <button
                                     type="button"
@@ -1909,16 +1849,12 @@
                             <ScreenHome
                                 onStart={() => { setIsTeacherHost(false); setScreen('identity'); }}
                                 onTeacher={async () => {
-                                    const autoCode = normalizeRoomCode(roomCode || window.FB_BRIDGE?.getActiveRoomCode?.() || DEFAULT_ROOM_CODE);
                                     setIsTeacherHost(true);
-                                    setRoomCode(autoCode);
                                     if (window.FB_BRIDGE?.ready) {
-                                        window.FB_BRIDGE.setActiveRoomCode(autoCode);
-                                        const existing = await window.FB_BRIDGE.fetchRoom(autoCode);
+                                        const existing = await window.FB_BRIDGE.fetchRoom(DEFAULT_ROOM_CODE);
                                         if (!existing) {
-                                            await window.FB_BRIDGE.upsertRoom(autoCode, {
-                                                roomCode: autoCode,
-                                                hostCode: makeHostCode(autoCode),
+                                            await window.FB_BRIDGE.upsertRoom(DEFAULT_ROOM_CODE, {
+                                                roomCode: DEFAULT_ROOM_CODE,
                                                 teacherName: teacherName || 'Guru Utama',
                                                 focusMode: false,
                                                 liveScreen: 'map',
@@ -1933,17 +1869,13 @@
                         {screen === 'identity' && (
                             <ScreenIdentity
                                 initialUser={user}
-                                defaultRoomCode={normalizeRoomCode(window.FB_BRIDGE?.getActiveRoomCode?.() || roomCode || DEFAULT_ROOM_CODE)}
                                 onBack={() => setScreen('home')}
                                 onComplete={async (data) => {
-                                    const fallbackCode = normalizeRoomCode(window.FB_BRIDGE?.getActiveRoomCode?.() || roomCode || DEFAULT_ROOM_CODE);
-                                    const cleanCode = normalizeRoomCode(data.roomCode) || fallbackCode;
                                     setIsTeacherHost(false);
-                                    setUser({ ...data, roomCode: cleanCode });
-                                    setRoomCode(cleanCode);
+                                    setUser({ ...data, roomCode: DEFAULT_ROOM_CODE });
 
-                                    if (cleanCode && window.FB_BRIDGE?.ready) {
-                                        await window.FB_BRIDGE.upsertPlayer(cleanCode, window.FB_BRIDGE.uid, {
+                                    if (window.FB_BRIDGE?.ready) {
+                                        await window.FB_BRIDGE.upsertPlayer(DEFAULT_ROOM_CODE, window.FB_BRIDGE.uid, {
                                             name: data.name,
                                             class: data.class || 'VII',
                                             groupName: data.groupName || '',
@@ -1952,7 +1884,7 @@
                                             stars: progress.stars,
                                             level: calcLevel(progress.points)
                                         });
-                                        const latestRoom = await window.FB_BRIDGE.fetchRoom(cleanCode);
+                                        const latestRoom = await window.FB_BRIDGE.fetchRoom(DEFAULT_ROOM_CODE);
                                         if (latestRoom) {
                                             setRoomData(latestRoom);
                                             if (latestRoom.sharedTask?.active) {
@@ -2010,8 +1942,8 @@
                             <ScreenLangFeatures
                                 data={MATERIAL_CONTENT.lang}
                                 locked={isStudentFocusLocked}
-                                syncedTab={roomData?.focusMode ? roomData?.liveActivity?.mat_lang?.tab : undefined}
-                                syncedBy={roomData?.focusMode ? roomData?.liveActivity?.mat_lang?.by : ''}
+                                syncedTab={(roomData?.focusMode || isTeacherHost) ? roomData?.liveActivity?.mat_lang?.tab : undefined}
+                                syncedBy={(roomData?.focusMode || isTeacherHost) ? roomData?.liveActivity?.mat_lang?.by : ''}
                                 onSyncTab={(tab) => syncLiveActivity('mat_lang', { tab })}
                                 onBack={() => setScreen('map')}
                                 onComplete={() => { addReward(10, 1, 'mat_lang'); if (!isStudentFocusLocked) setScreen('map'); }}
@@ -2040,7 +1972,7 @@
                             <ScreenDragDropSorter
                                 world={WORLDS_DATA[activeWorld]}
                                 locked={isStudentFocusLocked}
-                                syncedState={roomData?.focusMode ? roomData?.liveActivity?.[`vocab_${activeWorld}`] : null}
+                                syncedState={(roomData?.focusMode || isTeacherHost) ? roomData?.liveActivity?.[`vocab_${activeWorld}`] : null}
                                 onSyncState={(payload) => syncLiveActivity(`vocab_${activeWorld}`, payload)}
                                 showModal={showModal}
                                 onBack={() => setScreen('world_hub')}
@@ -2053,7 +1985,7 @@
                                 title={`${WORLDS_DATA[activeWorld].name}: Grammar Detective`}
                                 world={WORLDS_DATA[activeWorld]}
                                 locked={isStudentFocusLocked}
-                                syncedState={roomData?.focusMode ? roomData?.liveActivity?.[`grammar_${activeWorld}`] : null}
+                                syncedState={(roomData?.focusMode || isTeacherHost) ? roomData?.liveActivity?.[`grammar_${activeWorld}`] : null}
                                 onSyncState={(payload) => syncLiveActivity(`grammar_${activeWorld}`, payload)}
                                 showModal={showModal}
                                 onBack={() => setScreen('world_hub')}
@@ -2064,7 +1996,7 @@
                             <ScreenSentenceBuilder
                                 world={WORLDS_DATA[activeWorld]}
                                 locked={isStudentFocusLocked}
-                                syncedState={roomData?.focusMode ? roomData?.liveActivity?.[`sentence_${activeWorld}`] : null}
+                                syncedState={(roomData?.focusMode || isTeacherHost) ? roomData?.liveActivity?.[`sentence_${activeWorld}`] : null}
                                 onSyncState={(payload) => syncLiveActivity(`sentence_${activeWorld}`, payload)}
                                 showModal={showModal}
                                 onBack={() => setScreen('world_hub')}
@@ -2075,7 +2007,7 @@
                             <ScreenWritingBuilder
                                 world={WORLDS_DATA[activeWorld]}
                                 locked={isStudentFocusLocked}
-                                syncedState={roomData?.focusMode ? roomData?.liveActivity?.[`writing_${activeWorld}`] : null}
+                                syncedState={(roomData?.focusMode || isTeacherHost) ? roomData?.liveActivity?.[`writing_${activeWorld}`] : null}
                                 onSyncState={(payload) => syncLiveActivity(`writing_${activeWorld}`, payload)}
                                 showModal={showModal}
                                 onBack={() => setScreen('world_hub')}
@@ -2143,27 +2075,19 @@
                                 roomPlayers={roomPlayers}
                                 teacherName={teacherName}
                                 setTeacherName={setTeacherName}
-                                onHostRoom={(code, tName) => {
-                                    const clean = normalizeRoomCode(code) || DEFAULT_ROOM_CODE;
-                                    setIsTeacherHost(true);
-                                    setTeacherName(tName || 'Guru Utama');
-                                    setRoomCode(clean);
-                                    window.FB_BRIDGE.setActiveRoomCode(clean);
-                                    window.FB_BRIDGE.upsertRoom(clean, {
-                                        roomCode: clean,
-                                        hostCode: makeHostCode(clean),
-                                        teacherName: tName || 'Guru Utama',
-                                        focusMode: false,
-                                        liveScreen: 'map',
-                                        liveWorld: activeWorld
-                                    });
-                                }}
                                 onOpenTeacherMenu={(targetScreen = 'map') => {
                                     setIsTeacherHost(true);
+                                    window.FB_BRIDGE.upsertRoom(roomCode, {
+                                        roomCode,
+                                        teacherName: teacherName || 'Guru Utama',
+                                        liveScreen: targetScreen,
+                                        focusScreen: targetScreen,
+                                        focusWorld: activeWorld,
+                                        sharedTask: { ...(roomData?.sharedTask || {}), active: false }
+                                    });
                                     setScreen(targetScreen);
                                 }}
                                 onOpenSharedTask={(worldId) => {
-                                    if (!roomCode) return;
                                     setIsTeacherHost(true);
                                     window.FB_BRIDGE.upsertRoom(roomCode, {
                                         sharedTask: {
@@ -2174,7 +2098,6 @@
                                     });
                                     setScreen('live_shared_task');
                                 }}
-                                showModal={showModal}
                                 onBack={() => setScreen('home')}
                             />
                         )}
@@ -2200,49 +2123,6 @@
                         />
                     )}
 
-                    {/* Modal Ganti Kode Room Murid */}
-                    {showChangeCodeModal && (
-                        <div className="fixed inset-0 z-[75] flex items-center justify-center bg-slate-900/80 backdrop-blur-sm p-4">
-                            <div className="bg-white rounded-3xl p-6 max-w-md w-full shadow-[0_10px_0_#94a3b8] border-4 border-slate-200 animate-pop">
-                                <div className="text-center mb-4">
-                                    <div className="inline-flex items-center justify-center w-14 h-14 rounded-full bg-blue-100 text-3xl mb-2">
-                                        🔑
-                                    </div>
-                                    <h2 className="text-2xl font-black text-brand-deep">GANTI KODE ROOM</h2>
-                                    <p className="text-slate-600 font-bold text-xs mt-1">
-                                        Masukkan kode baru dari guru agar layar Anda otomatis mengikuti kegiatan yang sedang live.
-                                    </p>
-                                </div>
-                                <form onSubmit={handleSwitchStudentRoom} className="space-y-4">
-                                    <input
-                                        type="text"
-                                        maxLength={12}
-                                        autoFocus
-                                        value={newRoomCodeInput}
-                                        onChange={e => setNewRoomCodeInput(e.target.value.toUpperCase())}
-                                        placeholder="Masukkan Kode Baru (Contoh: AB12CD)"
-                                        className="w-full bg-blue-50 border-2 border-blue-300 rounded-xl p-3 font-black uppercase tracking-widest text-center text-brand-deep text-lg focus:border-brand-sky focus:outline-none"
-                                    />
-                                    <div className="flex gap-2">
-                                        <button
-                                            type="button"
-                                            onClick={() => setShowChangeCodeModal(false)}
-                                            className="flex-1 btn-3d bg-slate-200 text-slate-700 border-2 border-slate-300 shadow-[0_4px_0_#94a3b8] py-3 text-sm"
-                                        >
-                                            Batal
-                                        </button>
-                                        <button
-                                            type="submit"
-                                            className="flex-[2] btn-3d btn-primary py-3 text-sm"
-                                        >
-                                            🚀 Gabung & Ikuti Live
-                                        </button>
-                                    </div>
-                                </form>
-                            </div>
-                        </div>
-                    )}
-
                     {/* Mobile Bottom Bar */}
                     {!hideHeaderScreens.includes(screen) && screen !== 'achievements' && (
                         <div className="md:hidden bg-brand-deep border-t-2 border-blue-950 px-3 py-1 flex justify-around z-40 shrink-0">
@@ -2257,12 +2137,6 @@
                                         <span className="text-[10px] font-bold">Info</span>
                                     </button>
                                 </>
-                            )}
-                            {!isTeacherHost && (
-                                <button type="button" onClick={handleOpenChangeCode} className="text-brand-yellow flex flex-col items-center">
-                                    <span className="text-base">🔑</span>
-                                    <span className="text-[10px] font-bold">Ganti Kode</span>
-                                </button>
                             )}
                             <button type="button" onClick={handleGoHome} className="text-red-300 flex flex-col items-center">
                                 <span className="text-base">🏠</span>
@@ -2315,26 +2189,20 @@
             </div>
         );
 
-        const ScreenIdentity = ({ initialUser, defaultRoomCode, onBack, onComplete }) => {
-            const autoCode = normalizeRoomCode(defaultRoomCode || initialUser?.roomCode || DEFAULT_ROOM_CODE);
+        const ScreenIdentity = ({ initialUser, onBack, onComplete }) => {
             const [data, setData] = useState({
                 name: initialUser?.name || '',
                 class: initialUser?.class || '',
                 groupName: initialUser?.groupName || '',
                 members: initialUser?.members || '',
-                avatar: initialUser?.avatar || '🕵️‍♂️',
-                roomCode: autoCode
+                avatar: initialUser?.avatar || '🕵️‍♂️'
             });
             const avatars = ['🕵️‍♂️', '🕵️‍♀️', '🦊', '🐱', '🦁', '🐼', '🚀', '🌟'];
-
-            useEffect(() => {
-                setData(prev => ({ ...prev, roomCode: prev.roomCode || autoCode }));
-            }, [autoCode]);
 
             const handleSubmit = (e) => {
                 e.preventDefault();
                 if (!data.name.trim()) return;
-                onComplete({ ...data, roomCode: normalizeRoomCode(data.roomCode) || autoCode });
+                onComplete({ ...data, roomCode: DEFAULT_ROOM_CODE });
             };
 
             return (
@@ -2342,7 +2210,7 @@
                     <div className="game-card p-5 max-w-md w-full animate-pop">
                         <div className="flex justify-between items-center mb-3">
                             <button type="button" onClick={onBack} className="text-xs font-black text-slate-500 hover:text-brand-deep">⬅️ Home</button>
-                            <span className="text-xs font-black text-brand-purple uppercase">Multiplayer Login</span>
+                            <span className="text-xs font-black text-emerald-600 uppercase">🟢 Live Class Auto-Join</span>
                         </div>
                         <div className="text-center mb-3">
                             <span className="text-4xl block">{data.avatar}</span>
@@ -2372,11 +2240,6 @@
                                     <input type="text" className="w-full bg-slate-100 border-2 border-slate-300 rounded-xl p-2 text-sm font-bold focus:border-brand-sky focus:outline-none"
                                         value={data.class} onChange={e => setData({ ...data, class: e.target.value })} placeholder="VII-A" />
                                 </div>
-                            </div>
-                            <div>
-                                <label className="block text-xs font-extrabold text-blue-700 mb-0.5">🔑 Kode Room Otomatis (Semua Peserta Sama)</label>
-                                <input type="text" maxLength={10} className="w-full bg-blue-50 border-2 border-blue-300 rounded-xl p-2 text-sm font-black uppercase tracking-widest text-center text-brand-deep focus:border-brand-sky focus:outline-none"
-                                    value={data.roomCode} onChange={e => setData({ ...data, roomCode: e.target.value.toUpperCase() })} placeholder={autoCode} />
                             </div>
                             <div className="grid grid-cols-2 gap-2">
                                 <div>
@@ -2704,7 +2567,7 @@
             useEffect(() => {
                 if (syncedState?.placements) {
                     setPlacements(syncedState.placements);
-                    setCheckedStatus(null);
+                    setCheckedStatus(syncedState.checkedStatus || null);
                 }
             }, [syncedState?.ts]);
 
@@ -2717,7 +2580,7 @@
                 else next[itemId] = targetCatId;
                 setPlacements(next);
                 setSelectedItem(null);
-                if (onSyncState) onSyncState({ placements: next });
+                if (onSyncState) onSyncState({ placements: next, checkedStatus: null });
             };
 
             const handleCheck = () => {
@@ -2733,6 +2596,7 @@
                     if (isRight) correctCount++;
                 });
                 setCheckedStatus(statusMap);
+                if (onSyncState) onSyncState({ placements, checkedStatus: statusMap });
                 if (correctCount === world.sortItems.length) {
                     showModal("Awesome Job! 🌟", `All ${correctCount} phrases about ${world.subjectTitle} are correct!`, "success", onComplete);
                 } else {
@@ -3400,33 +3264,16 @@
             </div>
         );
 
-        const ScreenTeacherDashboard = ({ roomCode, roomData, roomPlayers, teacherName, setTeacherName, onHostRoom, onOpenTeacherMenu, onOpenSharedTask, showModal, onBack }) => {
-            const [coHostInput, setCoHostInput] = useState('');
-
-            const handleCreateRoom = () => {
-                const newCode = generateRoomCode();
-                onHostRoom(newCode, teacherName || 'Guru Utama');
-                showModal("Room Baru Dibuat! 🎉", `Kode Murid: ${newCode}\nKode Host (Guru Lain): ${makeHostCode(newCode)}`, "success");
-            };
-
-            const handleJoinCoHost = (e) => {
-                e.preventDefault();
-                const parsed = parseHostCode(coHostInput);
-                if (!parsed || parsed.length < 3) {
-                    showModal("Kode Host Tidak Valid ❌", "Masukkan Kode Host seperti HOST-AB12CD.", "error");
-                    return;
-                }
-                onHostRoom(parsed, teacherName || 'Guru Co-Host');
-                setCoHostInput('');
-                showModal("Berhasil Gabung Co-Host! 👩‍🏫", `Anda kini mengontrol Room ${parsed} bersama guru utama.`, "success");
-            };
-
+        const ScreenTeacherDashboard = ({ roomCode, roomData, roomPlayers, teacherName, setTeacherName, onOpenTeacherMenu, onOpenSharedTask, onBack }) => {
             const toggleFocus = () => {
                 if (!roomCode) return;
                 window.FB_BRIDGE.upsertRoom(roomCode, {
+                    roomCode,
+                    teacherName: teacherName || 'Guru Utama',
                     focusMode: !roomData?.focusMode,
                     focusScreen: roomData?.liveScreen && roomData.liveScreen !== 'dashboard' ? roomData.liveScreen : 'map',
-                    focusWorld: roomData?.liveWorld || 'people'
+                    focusWorld: roomData?.liveWorld || 'people',
+                    sharedTask: { ...(roomData?.sharedTask || {}), active: false }
                 });
             };
 
@@ -3434,18 +3281,23 @@
                 <div className="flex-1 p-4 bg-slate-100 overflow-y-auto">
                     <div className="max-w-5xl mx-auto space-y-4">
                         <div className="flex flex-wrap justify-between items-center gap-2">
-                            <h2 className="text-2xl font-black text-brand-deep">👩‍🏫 Teacher Dashboard & Host Room</h2>
+                            <h2 className="text-2xl font-black text-brand-deep">👩‍🏫 Teacher Dashboard & Mode Fokus</h2>
                             <button type="button" onClick={onBack} className="btn-3d btn-danger px-4 py-2 text-xs">
                                 🏠 Home
                             </button>
                         </div>
 
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            {/* Room Code & Host Code Card */}
-                            <div className="game-card p-4 space-y-3">
-                                <h3 className="font-black text-brand-deep text-base">🔑 Kelola Kode Room & Co-Host</h3>
+                        {/* Focus Mode Control Card (No Room Code UI) */}
+                        <div className="game-card p-5 space-y-4">
+                            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                                 <div>
-                                    <label className="text-xs font-extrabold text-slate-600">Nama Guru:</label>
+                                    <h3 className="font-black text-brand-deep text-lg">🎯 Kontrol Mode Fokus Kelas Live</h3>
+                                    <p className="text-xs font-bold text-slate-500">
+                                        Semua murid otomatis masuk bersama secara live. Aktifkan Mode Fokus agar setiap menu yang Anda buka langsung diikuti semua murid dan jawaban murid langsung tampil di layar Anda.
+                                    </p>
+                                </div>
+                                <div className="sm:w-56 shrink-0">
+                                    <label className="text-[11px] font-extrabold text-slate-600 block">Nama Guru:</label>
                                     <input
                                         type="text"
                                         value={teacherName}
@@ -3453,73 +3305,30 @@
                                         className="w-full bg-slate-100 border-2 border-slate-300 rounded-xl p-2 text-sm font-bold mt-0.5"
                                     />
                                 </div>
-                                <div className="flex gap-2">
-                                    <button type="button" onClick={handleCreateRoom} className="flex-1 btn-3d btn-primary py-2.5 text-xs">
-                                        ✨ Buat / Ganti Kode Baru
-                                    </button>
-                                </div>
-
-                                {roomCode && (
-                                    <div className="bg-blue-50 border-2 border-blue-200 rounded-xl p-3 space-y-2 text-xs">
-                                        <div className="flex justify-between items-center">
-                                            <span className="font-bold text-slate-600">Kode Bergabung Murid:</span>
-                                            <button type="button" onClick={() => { copyToClipboard(roomCode); showModal("Disalin!", `Kode Murid ${roomCode} disalin.`, "success"); }} className="font-black text-lg text-brand-deep bg-white px-3 py-0.5 rounded-lg border border-blue-300">
-                                                {roomCode} 📋
-                                            </button>
-                                        </div>
-                                        <div className="flex justify-between items-center">
-                                            <span className="font-bold text-slate-600">Kode Host (Guru Lain):</span>
-                                            <button type="button" onClick={() => { copyToClipboard(makeHostCode(roomCode)); showModal("Disalin!", `Kode Host ${makeHostCode(roomCode)} disalin.`, "success"); }} className="font-black text-sm text-purple-800 bg-purple-100 px-3 py-0.5 rounded-lg border border-purple-300">
-                                                {makeHostCode(roomCode)} 📋
-                                            </button>
-                                        </div>
-                                    </div>
-                                )}
-
-                                <form onSubmit={handleJoinCoHost} className="pt-2 border-t border-slate-200 flex gap-2">
-                                    <input
-                                        type="text"
-                                        value={coHostInput}
-                                        onChange={e => setCoHostInput(e.target.value.toUpperCase())}
-                                        placeholder="Gabung Kode Host (HOST-XXXXXX)"
-                                        className="flex-1 bg-purple-50 border-2 border-purple-200 rounded-xl px-3 py-2 text-xs font-black uppercase"
-                                    />
-                                    <button type="submit" className="btn-3d btn-purple px-3 py-2 text-xs">Gabung</button>
-                                </form>
                             </div>
 
-                            {/* Live Control Card */}
-                            <div className="game-card p-4 space-y-3">
-                                <h3 className="font-black text-brand-deep text-base">🎮 Kontrol Kelas Live</h3>
-                                <p className="text-xs font-bold text-slate-500">
-                                    Aktifkan Mode Fokus agar seluruh murid otomatis mengikuti setiap menu yang Anda buka, atau mulai Papan Drag & Drop Bersama.
-                                </p>
-                                <div className="grid grid-cols-1 gap-2">
-                                    <button
-                                        type="button"
-                                        disabled={!roomCode}
-                                        onClick={toggleFocus}
-                                        className={`w-full btn-3d py-3 text-sm ${roomData?.focusMode ? 'btn-danger' : 'btn-purple'}`}
-                                    >
-                                        {roomData?.focusMode ? '🔓 MATIKAN MODE FOKUS' : '🔒 AKTIFKAN MODE FOKUS'}
-                                    </button>
-                                    <button
-                                        type="button"
-                                        disabled={!roomCode}
-                                        onClick={() => onOpenTeacherMenu('map')}
-                                        className="w-full btn-3d btn-secondary py-3 text-sm"
-                                    >
-                                        🗺️ BUKA SEMUA MENU GAME (MURID MENGIKUTI)
-                                    </button>
-                                    <button
-                                        type="button"
-                                        disabled={!roomCode}
-                                        onClick={() => onOpenSharedTask('people')}
-                                        className="w-full btn-3d btn-success py-3 text-sm"
-                                    >
-                                        🧲 MULAI PAPAN DRAG & DROP BERSAMA
-                                    </button>
-                                </div>
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                                <button
+                                    type="button"
+                                    onClick={toggleFocus}
+                                    className={`w-full btn-3d py-3.5 text-sm ${roomData?.focusMode ? 'btn-danger' : 'btn-purple'}`}
+                                >
+                                    {roomData?.focusMode ? '🔓 MATIKAN MODE FOKUS' : '🔒 AKTIFKAN MODE FOKUS'}
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => onOpenTeacherMenu('map')}
+                                    className="w-full btn-3d btn-secondary py-3.5 text-sm"
+                                >
+                                    🗺️ BUKA MENU GAME (MURID MENGIKUTI)
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => onOpenSharedTask('people')}
+                                    className="w-full btn-3d btn-success py-3.5 text-sm"
+                                >
+                                    🧲 PAPAN DRAG & DROP BERSAMA
+                                </button>
                             </div>
                         </div>
 
@@ -3527,7 +3336,7 @@
                         <div className="game-card p-4">
                             <h3 className="font-black text-brand-deep text-base mb-2">🏆 Peringkat Murid Online ({roomPlayers.length})</h3>
                             {roomPlayers.length === 0 ? (
-                                <p className="text-center text-slate-400 font-bold text-xs py-4">Belum ada murid bergabung di Room {roomCode || '-'}.</p>
+                                <p className="text-center text-slate-400 font-bold text-xs py-4">Belum ada murid bergabung di kelas live.</p>
                             ) : (
                                 <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
                                     {roomPlayers.map((p, idx) => (
